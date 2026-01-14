@@ -1,0 +1,101 @@
+audio:
+  input:
+    sample_rate: 16000
+    channels: 1
+    buffer_size: 256  # frames
+    device: "default"
+
+  output:
+    sample_rate: 22050
+    channels: 1
+    buffer_size: 512
+    device: "default"
+
+asr:
+  # Whisper 模型路径（推荐使用 turbo 版本以平衡速度和质量）
+  model_path: "whisper.cpp/models/ggml-large-v3-turbo.bin"
+
+  # 语言代码（ISO 639-1）
+  language: "zh"  # 中文
+
+  # VAD 配置
+  enable_vad: true
+  vad_threshold: 0.5
+  vad_min_speech_duration: 0.5  # seconds
+  vad_max_speech_duration: 30.0
+  vad_min_silence_duration: 0.3
+
+  # Whisper 运行时配置
+  num_threads: 4
+  use_gpu: true
+  gpu_device_id: 0
+
+  # Whisper 特有参数
+  translate: false       # false=保持中文, true=翻译为英文
+  no_timestamps: true    # 禁用时间戳以提升速度
+  temperature: 0.0       # 0.0=贪婪解码（最准确）
+
+query:
+  mode: "hybrid"  # local, llm, hybrid
+
+  # 本地数据库配置
+  database:
+    path: "data/knowledge.db"
+    enable_fts: true
+    cache_size: 10000
+
+  # LLM 配置
+  llm:
+    type: "local"  # local, remote
+
+    # 本地 LLM (llama.cpp)
+    model_path: "models/qwen2-7b-instruct-q4_0.gguf"
+    context_length: 4096
+    n_gpu_layers: 35  # -1 for all layers
+
+    # 生成参数
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 40
+    max_tokens: 512
+
+    # 远程 API
+    api_url: "http://localhost:8000/v1/chat/completions"
+    api_key: ""
+
+  # 混合模式配置
+  hybrid:
+    use_local_first: true
+    local_confidence_threshold: 0.7
+
+tts:
+  model_dir: "models/cosyvoice2"
+  speaker: "中文女"
+
+  # 模式
+  enable_streaming: true
+  streaming_chunk_size: 512
+
+  # ONNX Runtime 配置
+  num_threads: 4
+  use_gpu: true
+  gpu_device_id: 0
+
+  # 生成参数
+  speed: 1.0
+  pitch: 1.0
+  energy: 1.0
+
+system:
+  # 日志配置
+  log_level: "info"  # trace, debug, info, warn, error, critical
+  log_path: "logs/voice_assistant.log"
+  log_max_size: 10485760  # 10MB
+  log_max_files: 5
+
+  # 线程池
+  num_workers: 4
+
+  # 性能监控
+  enable_profiling: false
+  profiling_interval: 10  # seconds

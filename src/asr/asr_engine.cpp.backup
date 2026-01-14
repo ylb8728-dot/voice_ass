@@ -1,0 +1,238 @@
+#include "asr_engine.h"
+#include "feature_extractor.h"
+#include "../utils/logger.h"
+#include <algorithm>
+#include <stdexcept>
+
+namespace voice_assistant {
+namespace asr {
+
+ASREngine::ASREngine(const Config& config)
+    : config_(config)
+    , initialized_(false)
+    , memory_info_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
+}
+
+ASREngine::~ASREngine() = default;
+
+bool ASREngine::initialize() {
+    try {
+        LOG_INFO("Initializing ASR engine...");
+
+        // 创建 ONNX Runtime 环境
+        env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "ASREngine");
+
+        // 创建 session options
+        session_options_ = std::make_unique<Ort::SessionOptions>();
+        session_options_->SetIntraOpNumThreads(config_.num_threads);
+        session_options_->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        // 配置 CUDA 执行提供者
+        if (config_.use_gpu) {
+#ifdef USE_CUDA
+            OrtCUDAProviderOptions cuda_options;
+            cuda_options.device_id = config_.gpu_device_id;
+            cuda_options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchExhaustive;
+            cuda_options.gpu_mem_limit = SIZE_MAX;
+            cuda_options.arena_extend_strategy = 1;
+            session_options_->AppendExecutionProvider_CUDA(cuda_options);
+            LOG_INFO("CUDA execution provider enabled (device ", config_.gpu_device_id, ")");
+#else
+            LOG_WARN("CUDA support not compiled, using CPU");
+#endif
+        }
+
+        // 加载模型
+        LOG_INFO("Loading ASR model: ", config_.model_path);
+        session_ = std::make_unique<Ort::Session>(
+            *env_, config_.model_path.c_str(), *session_options_);
+
+        // 打印模型信息
+        Ort::AllocatorWithDefaultOptions allocator;
+        size_t num_input_nodes = session_->GetInputCount();
+        size_t num_output_nodes = session_->GetOutputCount();
+
+        LOG_INFO("Model loaded: ", num_input_nodes, " inputs, ",
+                num_output_nodes, " outputs");
+
+        for (size_t i = 0; i < num_input_nodes; ++i) {
+            auto input_name = session_->GetInputNameAllocated(i, allocator);
+            LOG_DEBUG("  Input ", i, ": ", input_name.get());
+        }
+
+        for (size_t i = 0; i < num_output_nodes; ++i) {
+            auto output_name = session_->GetOutputNameAllocated(i, allocator);
+            LOG_DEBUG("  Output ", i, ": ", output_name.get());
+        }
+
+        initialized_ = true;
+        LOG_INFO("ASR engine initialized successfully");
+        return true;
+
+    } catch (const Ort::Exception& e) {
+        LOG_ERROR("ONNX Runtime error: ", e.what());
+        return false;
+    } catch (const std::exception& e) {
+        LOG_ERROR("Error initializing ASR engine: ", e.what());
+        return false;
+    }
+}
+
+std::string ASREngine::recognize(const float* audio, size_t num_samples) {
+    if (!initialized_) {
+        LOG_ERROR("ASR engine not initialized");
+        return "";
+    }
+
+    try {
+        // 提取特征
+        std::vector<float> features = extractFeatures(audio, num_samples);
+        if (features.empty()) {
+            LOG_WARN("Failed to extract features");
+            return "";
+        }
+
+        // 准备输入张量
+        std::vector<int64_t> input_shape = {1, static_cast<int64_t>(num_samples)};
+        std::vector<float> input_data(audio, audio + num_samples);
+
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info_, input_data.data(), input_data.size(),
+            input_shape.data(), input_shape.size());
+
+        std::vector<int64_t> length_shape = {1};
+        std::vector<int64_t> length_data = {static_cast<int64_t>(num_samples)};
+
+        Ort::Value length_tensor = Ort::Value::CreateTensor<int64_t>(
+            memory_info_, length_data.data(), length_data.size(),
+            length_shape.data(), length_shape.size());
+
+        // 运行推理
+        const char* input_names[] = {"speech", "speech_lengths"};
+        const char* output_names[] = {"logits"};
+
+        std::vector<Ort::Value> input_tensors;
+        input_tensors.push_back(std::move(input_tensor));
+        input_tensors.push_back(std::move(length_tensor));
+
+        auto output_tensors = session_->Run(
+            Ort::RunOptions{nullptr},
+            input_names, input_tensors.data(), 2,
+            output_names, 1);
+
+        // 获取输出
+        float* logits_data = output_tensors[0].GetTensorMutableData<float>();
+        auto logits_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+
+        size_t num_frames = logits_shape[1];
+        size_t vocab_size = logits_shape[2];
+
+        // CTC 解码
+        std::string text = ctcDecode(logits_data, num_frames, vocab_size);
+
+        // 应用热词
+        if (!config_.hotwords.empty()) {
+            text = applyHotwords(text);
+        }
+
+        LOG_INFO("ASR result: ", text);
+        return text;
+
+    } catch (const Ort::Exception& e) {
+        LOG_ERROR("ONNX Runtime error: ", e.what());
+        return "";
+    } catch (const std::exception& e) {
+        LOG_ERROR("Error during recognition: ", e.what());
+        return "";
+    }
+}
+
+void ASREngine::startStream() {
+    stream_buffer_.clear();
+    partial_result_.clear();
+    LOG_DEBUG("Stream recognition started");
+}
+
+void ASREngine::feedAudio(const float* audio, size_t num_samples) {
+    stream_buffer_.insert(stream_buffer_.end(), audio, audio + num_samples);
+}
+
+std::string ASREngine::getPartialResult() {
+    if (stream_buffer_.size() < 16000) {  // 至少 1 秒音频
+        return partial_result_;
+    }
+
+    partial_result_ = recognize(stream_buffer_.data(), stream_buffer_.size());
+    return partial_result_;
+}
+
+std::string ASREngine::endStream() {
+    std::string final_result = recognize(stream_buffer_.data(), stream_buffer_.size());
+    stream_buffer_.clear();
+    partial_result_.clear();
+    LOG_DEBUG("Stream recognition ended");
+    return final_result;
+}
+
+std::vector<float> ASREngine::extractFeatures(const float* audio, size_t num_samples) {
+    // 这里简化处理：直接返回音频数据
+    // 实际应使用 FeatureExtractor 提取 Fbank 特征
+    // FeatureExtractor extractor;
+    // return extractor.extractFbank(audio, num_samples);
+
+    return std::vector<float>(audio, audio + num_samples);
+}
+
+std::string ASREngine::ctcDecode(const float* logits, size_t num_frames, size_t vocab_size) {
+    // 简单的贪婪 CTC 解码
+    std::vector<int> tokens;
+    int blank_id = 0;  // 假设 blank token 是 0
+
+    for (size_t t = 0; t < num_frames; ++t) {
+        // 找到最大概率的 token
+        int max_token = 0;
+        float max_prob = logits[t * vocab_size];
+
+        for (size_t v = 1; v < vocab_size; ++v) {
+            float prob = logits[t * vocab_size + v];
+            if (prob > max_prob) {
+                max_prob = prob;
+                max_token = v;
+            }
+        }
+
+        // CTC 去重
+        if (max_token != blank_id) {
+            if (tokens.empty() || tokens.back() != max_token) {
+                tokens.push_back(max_token);
+            }
+        }
+    }
+
+    // 将 token 转换为文本（这里简化处理）
+    // 实际需要使用词典将 token ID 映射到字符/词
+    std::string text;
+    for (int token : tokens) {
+        // 简单示例：假设 token 1-26 对应 a-z
+        if (token > 0 && token <= 26) {
+            text += static_cast<char>('a' + token - 1);
+        }
+    }
+
+    return text;
+}
+
+std::string ASREngine::applyHotwords(const std::string& text) {
+    // 简单的热词替换
+    std::string result = text;
+
+    for (const auto& hotword : config_.hotwords) {
+        (void)hotword;  // Unused in placeholder implementation
+        // TODO: 实现更智能的热词匹配和替换
+    }
+
+    return result;
+}
+
+} // namespace asr
+} // namespace voice_assistant
